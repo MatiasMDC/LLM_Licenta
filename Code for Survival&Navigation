@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+import os
+from prepare_mountain_qa import prepare_mountain_qa
+from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments
+from peft import LoraConfig, get_peft_model
+
+def main():
+    root        = "/mnt/d/llama_wsl"
+    base_dir    = os.path.join(root, "models", "tinyllama-base")
+    adapter_dir = os.path.join(root, "models", "tinyllama-mountain-lora")
+    os.makedirs(adapter_dir, exist_ok=True)
+
+    # 1) Load base model & tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(base_dir, local_files_only=True)
+    model     = AutoModelForCausalLM.from_pretrained(
+        base_dir,
+        load_in_8bit=True,
+        device_map="auto",
+        local_files_only=True
+    )
+
+    # 2) Wrap in the same LoRA config
+    lora_cfg = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=["q_proj","v_proj"],
+        lora_dropout=0.10,
+        bias="none"
+    )
+    model = get_peft_model(model, lora_cfg)
+
+    # 3) Prep dataset (same as before)
+    ds = prepare_mountain_qa(root)["train"]
+    def preprocess(ex):
+        prompt = (
+            "You are an expert mountain-survival assistant. "
+            "Provide clear, step-by-step instructions.\n\n"
+            f"Q: {ex['question']}\nA:"
+        )
+        tok = tokenizer(prompt + ex["answer"],
+                        truncation=True,
+                        max_length=512)
+        return {
+            "input_ids":      tok["input_ids"],
+            "attention_mask": tok["attention_mask"],
+            "labels":         tok["input_ids"]
+        }
+    ds = ds.map(preprocess, batched=False)
+
+    # 4) TrainingArguments: bump num_train_epochs to the **total** you now want
+    #    e.g. if you ran 4 epochs before and want 4 more, set num_train_epochs=8
+    training_args = TrainingArguments(
+        output_dir=adapter_dir,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
+        num_train_epochs=45,       # total desired epochs 
+        learning_rate=1e-4,
+        optim="paged_adamw_8bit",
+        save_steps=len(ds),
+        save_total_limit=2,
+        logging_steps=50,
+        report_to="none",
+    )
+
+    # 5) Trainer & resume
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=ds
+    )
+    # this will detect the latest checkpoint in adapter_dir
+    trainer.train(resume_from_checkpoint=True)
+    trainer.save_model(adapter_dir)
+    print("✅ Continued Mountain-Survival LoRA saved to", adapter_dir)
+
+if __name__=="__main__":
+    main()
